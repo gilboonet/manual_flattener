@@ -1,5 +1,5 @@
 # manual_flattener
-OpenJSCAD script to flatten a CSG for lasercut
+http://openjscad.org script to flatten a CSG for lasercut
 
 Manual flattener is my first try at Github, so I hope it will be OK.
 
