@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<html>
+<!--
+
+== DEPLIAGE AUTOMATIQUE DE FICHIER STL ==
+
+Purpose:
+Déplie un volume (fichier STL) à plat pour sa reconstruction en papier ou carton.
+
+History:
+  2016/11/23: 0.1.0: version initiale (GD)
+
+-->
+<head>
+  <meta http-equiv="content-type" content="text/html; charset=UTF-8"/>
+  <title>Dépliage de fichier STL</title>
+  <script src="jquery/jquery-1.9.1.js?0.5.0"></script>
+  <script src="jquery/jquery.hammer.js?0.5.0"></script>
+  <script src="lightgl.js"></script>
+  <script src="csg.js?0.5.0"></script>
+  <script src="formats.js?0.5.0"></script>
+  <script src="openjscad.js?0.5.0"></script>
+  <script src="openscad.js?0.5.0"></script>
+  <script src="js/jscad-worker.js?0.5.0" charset="utf-8"></script>
+  <script src="js/jscad-function.js?0.5.0" charset="utf-8"></script>
+  <link rel="stylesheet" href="aplat.css" type="text/css">
+</head>
+
+<body onload="loadProcessor()">
+<!-- setup display of the errors as required by OpenJSCAD.js -->
+  <div class="jscad-container">
+    <div id="header">
+      <div id="errordiv">Ooops!</div>
+    </div>
+
+<!-- setup display of the viewer, i.e. canvas -->
+    <div oncontextmenu="return false;" id="viewerContext"></div>
+
+<!-- setup display of the design parameters, as required by OpenJSCAD.js -->
+<!-- set display: block to display this -->
+    <div id="parametersdiv" style="display: block;"></div>
+
+<!-- setup display of the status, as required by OpenJSCAD.js -->
+<!-- set display: block to display this -->
+    <div id="tail" style="display: block;">
+      <div id="statusdiv"></div>
+    </div>
+  </div>
+<!-- define the design and the parameters -->
+
+<input type="file" id="FSTL" name="F[]" accept=".stl" onchange = "LoadSTL()"/>
+
+<textarea id="zone_code" style="display:none;">
+// Code from AMI FISCHMAN from OpenJSCAD Google+ page https://plus.google.com/+AmiFischman/posts/eS6BZa1UKGy?sfc=true
+// This file demonstrates "flattening" of a 3D model (specified as
+// vertices+triangles) into a 2D image that can hopefully be cut out
+// of a sheet of paper/cardboard and folded to reassemble the original
+// 3D model.
+//
+// The inspiration for this is Gilbert Duval's G+ post:
+// https://plus.google.com/100661224181279700831/posts/afa3mDYXdtR
+// This file is discussed in the comments on
+// https://plus.google.com/u/0/+AmiFischman/posts/eS6BZa1UKGy
+//
+// To use this with a different input data set, search for [heart] in
+// this file and replace/add your own data.
+//
+// TODO/NOTES:
+// - Actually try cutting up a model and see if it works :)
+// - This file contains a mess of both Vector[23]D objects and
+//   2/3-element arrays.  Should be cleaned up to be Vector[23]D
+//   everywhere instead.
+// - Rotate labels to maximize odds of fitting, and/or shrink to fit
+//   (both inside triangles and flaps)
+// - Omit labels of completely-connected triangles, for speed.
+// - Currently overlapping flaps for a triangle are dropped even if
+//   the neighbor is not flush.  Could trim such flaps instead of dropping.
+// - Requires OpenJSCAD dev branch as of 20161002 to generate DXF/SVG
+//   (because of
+//   https://github.com/Spiritdude/OpenJSCAD.org/issues/178).
+//   Workaround is to union(ob) at the bottom of flatten(), but that
+//   imposes a significant slowdown.
+//
+// NOTE: some models trigger "Area is not closed!" errors; work around
+// this by generating DXF for partial subsets of triangles.
+// https://github.com/Spiritdude/OpenJSCAD.org/issues/185
+
+function getParameterDefinitions() {
+    return [
+        { name: 'model', type: 'choice', caption: 'Choose model',
+          values: ['pyramide', 'fichier'],
+        },
+        { name: 'scaleFactor', type: 'float', initial: 1.0, caption: 'Geometry scale factor: ' },
+        { name: 'show3D', type: 'checkbox', checked: false, caption: 'Render 3D instead of flattening?' },
+        { name: 'lineThickness', type: 'float', initial: 0.05, caption: 'Line thickness: ' },
+        { name: 'textRadiusForCAG', type: 'float', initial: 1, caption: 'Thickness of text lines:' },
+        { name: 'textScale', type: 'float', initial: 0.03, caption: 'Scale factor for text:' },
+        { name: 'includeLabels', type: 'checkbox', checked: true, caption: 'Label triangles?' },
+        { name: 'useAreasInsteadOfLines', type: 'checkbox', checked: false, caption: 'Use areas instead of lines?' },
+        { name: 'flapHeightRatio', type: 'float', initial: 0.25, caption: 'Height ratio of flap to triangle:' },
+    ];
+}
+const epsilon = 1e-3;  // Anything smaller than this we call close enough to 0 to round.
+var globalParams;
+
+// Mimic polyhedron() but return the result as a union of faces so that the sliders allow exploration.
+function progressivePolyhedron(data) {
+    const v = data.points;
+    const o = data.triangles.map((tri) => {
+        const v0 = new CSG.Vertex(new CSG.Vector3D(v[tri[0]]));
+        const v1 = new CSG.Vertex(new CSG.Vector3D(v[tri[1]]));
+        const v2 = new CSG.Vertex(new CSG.Vector3D(v[tri[2]]));
+        return new CSG.Polygon([v0, v1, v2]).extrude(0.001);
+    });
+    return o;
+}
+
+function main(params) {
+    console.profile('main');
+    globalParams = params;
+    let model = params.model == 'pyramide' ? pyramid() :
+          params.model == 'fichier' ? volume() :
+          die('Unexpected model!');
+    model = simplifyGeometry(model);
+    const factor = params.scaleFactor;
+    model.points = model.points.map((p) => [p[0] * factor, p[1] * factor, p[2] * factor]);
+    const r = params.show3D ? progressivePolyhedron(model) : flatten(model);
+    console.profileEnd('main');
+	var V = r;
+	console.log("nb:"+V.length);
+	while(V.length >1){
+		var U = [];
+		for(var i=0; i<V.length; i+=10){
+			var tmp = V[i];
+			for(j=1; j<10; j++){
+				if((i+j) < V.length){
+					tmp = tmp.union(V[i+j])
+				}
+			}
+			U.push(tmp);
+		}
+		console.log("nb:"+U.length);
+		V = U;
+	}
+	return U;
+}
+
+function die(...args) {
+    console.error(...args);
+    throw args.join('\n');
+}
+
+// Given points/triangles (like input to polyhedron()), return a
+// union of CSGs each of which is a "fattened" version of an input
+// triangle, to aid visual debugging.
+function fatten(data) {
+    const v = data.points;
+    return data.triangles.map((tri) => {
+        const v0 = new CSG.Vertex(new CSG.Vector3D(v[tri[0]]));
+        const v1 = new CSG.Vertex(new CSG.Vector3D(v[tri[1]]));
+        const v2 = new CSG.Vertex(new CSG.Vector3D(v[tri[2]]));
+        return new CSG.Polygon([v0, v1, v2]).extrude(0.1);
+    });
+}
+
+// Given an array of triangles (3-tuples) such as might be fed to
+// polyhedron(), return their adjacency graph.  Two triangles are
+// adjacent if they share two vertices (in any order).  The graph is
+// represented as an array where the i'th entry is an array containing
+// the indexes of the triangles that are adjacent to input triangle i.
+// Even though the property of adjacency is symmetric we store all the
+// pairs (not just e.g. i<j) because sometimes the spatial constraints
+// can't be satisfied in a monotonic order.
+function adjacencyGraph(triangles, vertices) {
+    let graph = [];
+    for (let i = 0; i < triangles.length; ++i) {
+        const ti = triangles[i];
+        const si = new Set(ti);
+        let adjacentToI = [];
+        for (let j = 0; j < triangles.length; ++j) {
+            if (i == j) continue;
+            const tj = triangles[j];
+            if (tj.filter(x => si.has(x)).length >= 2) {
+                adjacentToI.push(j);
+            }
+        }
+        graph.push(adjacentToI);
+    }
+    if (graph.length != triangles.length) die('IMPOSSIBLE', graph, triangles);
+    let degenerate = [];
+    for (let i = 0; i < triangles.length; ++i) {
+        if (graph[i].length != 3) {
+            if (graph[i].length > 3) die('Wat?', graph[i]);
+            degenerate.push(triangles[i]);
+            for (let t = 0; t < graph[i].length; ++t) {
+                degenerate.push(triangles[graph[i][t]]);
+            }
+            break;
+        }
+    }
+    if (degenerate.length > 0) {
+        die('Triangles with other than 3 neighbors?', degenerate);
+    }
+    return graph;
+}
+
+// Return a transform that puts the triangle v1,v2,v3 in the X-Y plane
+// with v1 going to [0,0] and v2 going to the X-axis.
+function getTransformToXY(v1, v2, v3) {
+    v1 = new CSG.Vector3D(v1);
+    v2 = new CSG.Vector3D(v2);
+    v3 = new CSG.Vector3D(v3);
+    let tPlane = CSG.Plane.fromPoints(v1, v2, v3);
+    const triangleConnector = new CSG.Connector(v1, v2.minus(v1), tPlane.normal);
+    const z0ConnectorX = new CSG.Connector([0, 0, 0], [v2.minus(v1).length(), 0, 0], [0, 0, 1]);
+    return triangleConnector.getTransformationTo(z0ConnectorX, false, 0);
+}
+
+// Place and return |unplaced| in the X-Y plane, so that the triangle
+// [ret,p1placed,p2placed] is a rigid transformation of
+// [unplaced,p1,p2], and ret is on the other side of
+// [p1placed,p2placed] compared to p3placed.
+function placeOutside(unplaced, p1, p1placed, p2, p2placed, p3, p3placed) {
+    let tPlane = CSG.Plane.fromPoints(p1, p2, unplaced);
+    const triangleConnector = new CSG.Connector(p1, p2.minus(p1), tPlane.normal);
+    const z0Connector = new CSG.Connector(p1placed, p2placed.minus(p1placed), [0, 0, 1]);
+    const m = triangleConnector.getTransformationTo(z0Connector, false, 0);
+    const p2m = m.leftMultiply1x3Vector(p2);
+    if (!withinEpsilon(p2placed.distanceTo(p2m))) die('p2 went somewhere unexpected', p2, p2placed, p2m);
+    const placed = m.leftMultiply1x3Vector(unplaced);
+    if (isOpposite(placed, [p1placed, p2placed, p3placed])) {
+        checkTrianglesAreEqual(placed, p1placed, p2placed, unplaced, p1, p2);
+        return placed;
+    } else {
+        const p1pz = new CSG.Vector3D(p1placed);
+        const p2pz = new CSG.Vector3D(p2placed);
+        const placedp1p2VerticalPlane = CSG.Plane.fromPoints(p1pz, p2pz, p1pz.plus(new CSG.Vector3D(0, 0, 1)));
+        const alternate = CSG.Matrix4x4.mirroring(placedp1p2VerticalPlane).leftMultiply1x3Vector(placed);
+        if (isOpposite(alternate, [p1placed, p2placed, p3placed])) {
+            checkTrianglesAreEqual(alternate, p1placed, p2placed, unplaced, p1, p2);
+            return alternate;
+        }
+    }
+    die('placeOutside: ', p1placed, p2placed, p3placed);
+}
+
+function checkWithinEpsilon(val) {
+    if (!withinEpsilon(val))
+        die('Greater than epsilon: ' + val);
+}
+
+function withinEpsilon(val1, val2) {
+    if (val2 === undefined)
+        val2 = 0;
+    if (val1 === undefined)
+        die('Unexpected undefined value!');
+    return Math.abs(val1-val2) < epsilon;
+}
+
+// Cache of the digits 0..9 as CAGs, at the radius and scale requested
+// in globalParams.  Each element is a 2-tuple where [0] is a
+// CAG and [1] is the width of [0].
+var _DIGITS = [];
+
+function initializeDigits() {
+    if (_DIGITS.length) die('Already initialized?', _DIGITS);
+    const spacer = 0.1;
+    for (var digit = 0; digit < 10; ++digit) {
+        const o = [];
+        vector_text(0, 0, '' + digit).forEach((pl) => {
+            o.push(new CSG.Path2D(pl, false).expandToCAG(globalParams.textRadiusForCAG).scale(globalParams.textScale));
+        });
+        const c = union(o);
+        const b = c.getBounds();
+        _DIGITS.push([c.translate([-b[0].x, -(b[1].y-b[0].y)/2, 0]), b[1].x-b[0].x + spacer]);
+    }
+}
+
+// Returns a CAG spelling out |num| centered at (x,y).
+function text(center, num) {
+    if (_DIGITS.length == 0) {
+        initializeDigits();
+    }
+
+    var r = [];
+    var totalShift = 0;
+    do {
+        const d = _DIGITS[num % 10];
+        if (r.length) {
+            r = r.map((cag) => cag.translate([d[1], 0, 0]));
+        }
+        r = r.concat(d[0]);
+        totalShift += d[1];
+        num = Math.floor(num/10);
+    } while (num);
+    r = r.map((cag) => cag.translate([-totalShift/2 + center.x, center.y, 0]));
+    // For debugging:
+    // r.push(CAG.circle({center: [center.x, center.y], radius: 0.1}));
+    return r;
+}
+
+// "label" is the triangle's label (integer) or -1 to omit labels.
+// "verts" is a 3-tuple naming the 2D vertices of the triangle.
+function makeTriangleFrom(label, verts) {
+    var labelCAG;
+    if (label != -1) {
+        const center = verts.reduce((prev, current) => { return prev.plus(current); }, new CSG.Vector3D([0, 0, 0])).dividedBy(verts.length);
+        labelCAG = text(center, label);
+    }
+    if (globalParams.useAreasInsteadOfLines) {
+        var ret = CAG.fromPoints(verts);
+        if (labelCAG)
+            ret = ret.subtract(labelCAG);
+        return ret;
+    }
+    var ret = [new CSG.Path2D(verts, true).expandToCAG(globalParams.lineThickness)];
+    if (labelCAG)
+        ret = ret.concat(labelCAG);
+    return ret;
+}
+
+// Return a flap named "label" of height trapHeight, attached to
+// [edgeStart, edgeEnd], away from |opposite|.  The first parameter is
+// an integer and the last 3 parameters are Vector2D's.
+function makeFlap(label, trapHeight, edgeStart, edgeEnd, opposite) {
+    const delta = edgeEnd.minus(edgeStart);
+    var perp = delta.normal().unit().times(trapHeight);
+    var antiperp = perp.times(-1);
+    if (edgeStart.plus(perp).minus(opposite).lengthSquared() <
+        edgeStart.plus(antiperp).minus(opposite).lengthSquared()) {
+        perp = antiperp;
+    }
+    const baseStart = edgeStart.plus(delta.times(0.25));
+    const baseEnd = edgeStart.plus(delta.times(0.75));
+    const topEnd = edgeStart.plus(delta.times(0.65)).plus(perp);
+    const topStart = edgeStart.plus(delta.times(0.35)).plus(perp);
+    return {
+        baseStart: baseStart,
+        baseEnd: baseEnd,
+        topStart: topStart,
+        topEnd: topEnd,
+        label: label,
+        center: edgeStart.plus(delta.times(0.5)).plus(perp.times(0.5))
+    };
+}
+
+function flapsToCAGs(flaps) {
+    r = [];
+    for (var [k, v] of flaps) {
+        v.forEach((flap) => {
+            r.push(new CSG.Path2D([flap.baseStart, flap.baseEnd, flap.topEnd, flap.topStart], true)
+                   .expandToCAG(globalParams.lineThickness));
+            r = addToArray(r, text(flap.center, flap.label));
+        });
+    }
+    return r;
+}
+
+function checkTrianglesAreEqual(v1, v2, v3, w1, w2, w3) {
+    v1 = new CSG.Vector3D(v1);
+    v2 = new CSG.Vector3D(v2);
+    v3 = new CSG.Vector3D(v3);
+    w1 = new CSG.Vector3D(w1);
+    w2 = new CSG.Vector3D(w2);
+    w3 = new CSG.Vector3D(w3);
+    const v1v2 = v1.minus(v2).length();
+    const v1v3 = v1.minus(v3).length();
+    const v3v2 = v3.minus(v2).length();
+    const w1w2 = w1.minus(w2).length();
+    const w1w3 = w1.minus(w3).length();
+    const w3w2 = w3.minus(w2).length();
+    const vLengths = [v1v2, v1v3, v3v2];
+    const wLengths = [w1w2, w1w3, w3w2];
+    for (let i = 0; i < 3; ++i) {
+        if (!withinEpsilon(vLengths[i], wLengths[i])) {
+            die('Triangles are not equal!\nv1,v2,v3: ', v1, v2, v3,
+                '\nw1,w2,w3: ', w1, w2, w3, '\nvLengths: ',
+                vLengths, '\nwLengths: ', wLengths);
+        }
+    };
+}
+
+// Return whether two segments intersect.  Segments are specified as
+// 2-tuples each of which is a 2-tuple of XY coordinates.
+function doSegmentsIntersect(s1, s2) {
+    checkIsVector(s1[0]); checkIsVector(s1[1]); checkIsVector(s2[0]); checkIsVector(s2[1]);
+    // Adapted from http://stackoverflow.com/a/24392281
+    const a = s1[0].x, b = s1[0].y, c = s1[1].x, d = s1[1].y;
+    const p = s2[0].x, q = s2[0].y, r = s2[1].x, s = s2[1].y;
+    if ((withinEpsilon(a, p) && withinEpsilon(b, q)) ||
+        (withinEpsilon(a, r) && withinEpsilon(b, s)) ||
+        (withinEpsilon(c, p) && withinEpsilon(d, q)) ||
+        (withinEpsilon(c, r) && withinEpsilon(d, s))) {
+        // Sharing a vertex means no intersection we care about.
+        return false;
+    }
+    const det = (c - a) * (s - q) - (r - p) * (d - b);
+    if (withinEpsilon(det)) {
+        return false;
+    }
+    const lambda = ((s - q) * (r - a) + (p - r) * (s - b)) / det;
+    const gamma = ((b - d) * (r - a) + (c - a) * (s - b)) / det;
+    const ret = (0 < lambda && lambda < 1) && (0 < gamma && gamma < 1);
+    return ret;
+}
+
+// Returns whether the triangle formed by p,triangle[0],triangle[1] is
+// "opposite" |triangle|.
+function isOpposite(p, triangle) {
+    // Given an observer at a looking at b, this returns +1,0,-1 if p
+    // is on the left, on the line, or on the right, resp.
+    let whichSideOfSegmentIsPointOn = function(p, a, b) {
+        checkIsVector(a); checkIsVector(b); checkIsVector(p);
+        // Determinant of [ab,ap] (http://stackoverflow.com/a/1560510)
+        const det = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        if (withinEpsilon(det)) return 0;
+        return det < 0 ? -1 : +1;
+    }
+    const pSign = whichSideOfSegmentIsPointOn(p, triangle[0], triangle[1]);
+    const tSign = whichSideOfSegmentIsPointOn(triangle[2], triangle[0], triangle[1]);
+    const ret = (pSign == 0) ? false : pSign != tSign;
+    return ret;
+}
+
+function checkIsVector(v) {
+    if (v.x === undefined || v.y === undefined)
+        die('Should be a Vector3D but was: ' + JSON.stringify(v));
+}
+
+function vec3(v) {
+    if (v.length != 3 || v.x !== undefined) die('v should be a float[3]: ', v);
+    return new CSG.Vector3D(v);
+}
+
+function vec2(v) {
+    if (v.length != 2 || v.x !== undefined || isNaN(v[0]+v[1])) die('v should be a float[2]: ', v);
+    return new CSG.Vector2D(v);
+}
+
+function doesSegmentIntersectFlap(segment, flap) {
+    return doSegmentsIntersect(segment, [flap.baseStart, flap.baseEnd]) ||
+        doSegmentsIntersect(segment, [flap.baseEnd, flap.topEnd]) ||
+        doSegmentsIntersect(segment, [flap.topEnd, flap.topStart]) ||
+        doSegmentsIntersect(segment, [flap.topStart, flap.baseStart]);
+}
+
+function isFlapOnLine(flap, line) {
+    return withinEpsilon(line.absDistanceToPoint(flap.baseStart)) &&
+        withinEpsilon(line.absDistanceToPoint(flap.baseEnd));
+}
+
+function doesFlapIntersectTriangle(flap, triangle) {
+    const tSegments = [
+        [triangle[0], triangle[1]],
+        [triangle[1], triangle[2]],
+        [triangle[2], triangle[0]],
+    ];
+    const tLines = [
+        CSG.Line2D.fromPoints(triangle[0], triangle[1]),
+        CSG.Line2D.fromPoints(triangle[1], triangle[2]),
+        CSG.Line2D.fromPoints(triangle[2], triangle[0]),
+    ];
+    for (var line of tLines) {
+        if (isFlapOnLine(flap, line)) {
+            return true;
+        }
+    }
+    for (var segment of tSegments) {
+        if (doesSegmentIntersectFlap(segment, flap)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function doesFlapIntersectFlap(flapA, flapB) {
+    return doesSegmentIntersectFlap([flapA.baseStart, flapA.baseEnd], flapB) ||
+        doesSegmentIntersectFlap([flapA.baseEnd, flapA.topEnd], flapB) ||
+        doesSegmentIntersectFlap([flapA.topEnd, flapA.topStart], flapB) ||
+        doesSegmentIntersectFlap([flapA.topStart, flapA.baseStart], flapB);
+}
+
+// Returns all the flaps that overlap with "triangle" (a 3-tuple
+// naming the Vector2D vertices of a triangle).  Returned flaps are
+// identified as a tuple of [label, index] where label is the
+// key in "flaps" and index is the index into flaps[label].
+function overlapsWithFlaps(triangle, flaps) {
+    const tSegments = [
+        [triangle[0], triangle[1]],
+        [triangle[1], triangle[2]],
+        [triangle[2], triangle[0]],
+    ];
+    const tLines = [
+        CSG.Line2D.fromPoints(triangle[0], triangle[1]),
+        CSG.Line2D.fromPoints(triangle[1], triangle[2]),
+        CSG.Line2D.fromPoints(triangle[2], triangle[0]),
+    ];
+
+    const overlaps = [];
+    for (var [k, v] of flaps) {
+        for (var i = 0; i < v.length; ++i) {
+            const flap = v[i];
+            var overlapFound = false;
+            for (var e = 0; e < 3 && !overlapFound; ++e) {
+                const tLine = tLines[e];
+                if (isFlapOnLine(flap, tLine)) {
+                    overlapFound = true;
+                    break;
+                }
+            }
+            for (var e = 0; e < 3 && !overlapFound; ++e) {
+                const tSegment = tSegments[e];
+                if (doesSegmentIntersectFlap(tSegment, flap)) {
+                    overlapFound = true;
+                    break;
+                }
+            }
+            if (overlapFound) {
+                overlaps.push([k, i]);
+            }
+        }
+    }        
+    return overlaps;
+}
+    
+function subtract(a, b) {
+    if (Array.isArray(a)) {
+        const s = a.map((e) => subtract(e, b));
+        for (var i = s.length - 1; i >= 0; --i) {
+            if (withinEpsilon(area(s[i]))) {
+                s.splice(i, 1);
+            }
+        }
+        return s;
+    }
+    return a.subtract(b);
+}
+
+function area(a) {
+    if (Array.isArray(a)) {
+        return a.reduce((prev, cur) => prev + area(cur), 0);
+    }
+    return a.area();
+}
+
+// Given a dict of vertices & triangles (such as might be fed to
+// polyhedron()), return a union of CAGs of a flattened version of the
+// input.  Each input triangle is translated/rotated to the X-Y plane,
+// and if two triangles touch in the output then they touched in the
+// input.  Multiple (separate) connected components may be returned,
+// even if the input is connected.
+function flatten(params) {
+    const vertices = params.points;
+    const triangles = params.triangles;
+    const graph = adjacencyGraph(triangles, vertices);
+    const processedTriangles = new Set(); // Indexes into |triangles|.
+    
+	// Affiche liste des voisins
+    var ch = [];
+	for (var i in graph){
+		ch = ch+ i+':'+ graph[i].join()+'\n';
+	}
+	echo(ch);
+	
+	let ret = [];
+    while (triangles.length != processedTriangles.size) {  // In case of multiple connected components.
+
+        // Each member of readyForProcessing is an array with 1 or 5
+        // elements.  The first element is always an index into
+        // triangles, indicating the triangle that needs to be
+        // processed next, by placing its last vertex (its other two
+        // vertices are already placed by a neighbor).  The second
+        // element is the index into vertices of the unplaced vertex
+        // of this triangle.  The rest are each a 2-element array
+        // representing the placed vertices of the neighboring
+        // triangle that added the current one to the list.  Each
+        // vertex is represented as a 2-element array of the original
+        // index into vertices and an XY coord of the transformed
+        // vertex.  These vertices are ordered so that the last one is
+        // the one that is not shared between the neighbor and current
+        // triangles.
+        const nextToProcess = triangles.findIndex((elt,index) => !processedTriangles.has(index));
+        if (nextToProcess < 0) die('Not all triangles finalized, but all processed?!?');
+        var readyForProcessing = [[nextToProcess]];
+
+        const finalizedTriangles = []; // Each element will be a 4-tuple: 3 XY coords and the triangle's label (index).
+        var flaps = new Map();
+        while (readyForProcessing.length > 0) {
+            const current = readyForProcessing.shift();
+            if (processedTriangles.has(current[0])) {
+                continue;
+            }
+            const t = triangles[current[0]];
+            let transformed;  // Will hold the XY-transformed form of t.
+            if (current.length == 1) {
+                if (finalizedTriangles.length > 0) { die('Should be first triangle only!'); }
+                const transform = getTransformToXY(vertices[t[0]], vertices[t[1]], vertices[t[2]]);
+                const t0 = transform.leftMultiply1x3Vector(new CSG.Vector3D(vertices[t[0]]));
+                checkWithinEpsilon(t0.x); checkWithinEpsilon(t0.y); checkWithinEpsilon(t0.z);
+                const t1 = transform.leftMultiply1x3Vector(new CSG.Vector3D(vertices[t[1]]));
+                checkWithinEpsilon(t1.y); checkWithinEpsilon(t1.z);
+                const t2 = transform.leftMultiply1x3Vector(new CSG.Vector3D(vertices[t[2]]));
+                checkWithinEpsilon(t2.z);
+                transformed = [[t0.x, t0.y], [t1.x, t1.y], [t2.x, t2.y]];
+                checkTrianglesAreEqual(transformed[0], transformed[1], transformed[2],
+                                       vertices[t[0]], vertices[t[1]], vertices[t[2]]);
+            } else {
+                if (finalizedTriangles.length == 0 || current.length != 5) { die('Unexpected shift: ' + JSON.stringify(current)); }
+                const unplaced = current[1];
+                const candidate = placeOutside(
+                    vec3(vertices[unplaced]),
+                    vec3(vertices[current[2][0]]), vec2(current[2][1]),
+                    vec3(vertices[current[3][0]]), vec2(current[3][1]),
+                    vec3(vertices[current[4][0]]), vec2(current[4][1]));
+                checkWithinEpsilon(candidate.z);
+                // Even a candidate that is outside the neighbor triangle
+                // might cross another finalized triangle.  Give up now
+                // and hope some other edge adjacency makes up for this.
+                // The condition to check is that the two segments being
+                // added by placement of candidate don't intersect any of
+                // the segments already in finalizedTriangles.
+                const newSegments = [[candidate, vec2(current[2][1])], [candidate, vec2(current[3][1])]];
+                const overlappingFlaps = overlapsWithFlaps(
+                    [candidate, vec2(current[2][1]), vec2(current[3][1])], flaps);
+                if (0 <= overlappingFlaps.findIndex((elt, index, array) => elt[0] != current[0]) ||
+                    0 <= finalizedTriangles.findIndex(
+                    (elt, index, array) => {
+                        return doSegmentsIntersect(newSegments[0], [elt[0], elt[1]]) ||
+                            doSegmentsIntersect(newSegments[1], [elt[0], elt[1]]) ||
+                            doSegmentsIntersect(newSegments[0], [elt[2], elt[1]]) ||
+                            doSegmentsIntersect(newSegments[1], [elt[2], elt[1]]) ||
+                            doSegmentsIntersect(newSegments[0], [elt[2], elt[0]]) ||
+                            doSegmentsIntersect(newSegments[1], [elt[2], elt[0]]); })) {
+                    // Getting here means we can't place this
+                    // candidate.  Stop trying and let another
+                    // connected component include it.                    
+                    continue;
+                }
+                // Since we can place this triangle, we can drop the
+                // flaps that pointed at it from its near neighbors.
+                //
+                // NOTE: could be improved by trimming instead of
+                // outright removing flaps from nearby-but-not-flush
+                // neighbors.
+                for (var i = overlappingFlaps.length - 1; i >= 0; --i) {
+                    const oflap = overlappingFlaps[i];
+                    const kflaps = flaps.get(oflap[0]);
+                    kflaps.splice(oflap[1], 1);
+                }
+                
+                const p = [candidate.x, candidate.y];
+                transformed = [undefined, undefined, undefined];
+                for (let i = 0; i < 3; ++i) {
+                    transformed[i] =
+                        t[i] == unplaced ? p :
+                        t[i] == current[2][0] ? current[2][1] :
+                        t[i] == current[3][0] ? current[3][1] :
+                        undefined;
+                    if (transformed[i] === undefined) die('wat?');
+                }
+                checkTrianglesAreEqual(transformed[0], transformed[1], transformed[2],
+                                       vertices[t[0]], vertices[t[1]], vertices[t[2]]);
+            }
+
+            const neighbors = graph[current[0]];
+            if (!neighbors) continue;
+            const tVertices = new Set(t);
+            const addToReady = [];
+            var giveUp = false;  // If we can't place flaps for all unprocessed neighbors, we'll give up.
+            var addToFlaps = new Map();
+            for (let i = 0; i < neighbors.length; ++i) {
+                const n = neighbors[i];
+                if (processedTriangles.has(n)) {
+                    continue;
+                }
+                let ready = [n];
+                const nt = triangles[n];
+                var newVertex = nt.filter((v) => !tVertices.has(v));
+                if (newVertex.length != 1) die('Unexpected!');
+                ready.push(newVertex[0]);
+                for (var v = 0; v < 3; ++v) {
+                    ready.push([t[v], transformed[v]]);
+                }
+                const nVertices = new Set(nt);
+                if (!nVertices.has(t[0])) { [ready[2], ready[4]] = [ready[4], ready[2]]; }
+                else if (!nVertices.has(t[1])) { [ready[3], ready[4]] = [ready[4], ready[3]]; }
+                if (!nVertices.has(ready[2][0]) || !nVertices.has(ready[3][0])) { console.log(nVertices); die('wat?'); }
+                if (ready.length != 5) { die('Unexpected ready: ' + JSON.stringify(ready)); }
+
+                const trapHeight = CSG.Line3D.fromPoints(vec3(vertices[ready[2][0]]), vec3(vertices[ready[3][0]]))
+                      .distanceToPoint(vec3(vertices[ready[1]])) * globalParams.flapHeightRatio;
+                if (trapHeight < 0.001) die(trapHeight);
+
+                flap = makeFlap(n, trapHeight, vec2(ready[3][1]), vec2(ready[2][1]), vec2(ready[4][1]));
+                for (var ft of finalizedTriangles) {
+                    if (doesFlapIntersectTriangle(flap, ft)) {
+                        giveUp = true;
+                        break;
+                    }
+                }
+                for (var [k, v] of flaps) {
+                    for (var otherflap of v) {
+                        if (doesFlapIntersectFlap(flap, otherflap)) {
+                            giveUp = true;
+                            break;
+                        }
+                    }
+                }
+                if (!addToFlaps.has(n)) {
+                    addToFlaps.set(n, []);
+                }
+                addToFlaps.get(n).push(flap);
+                addToReady.push(ready);
+            }
+            if (giveUp) {
+                continue;
+            }
+            
+            for (var [k,v] of addToFlaps) {
+                if (!flaps.get(k)) {
+                    flaps.set(k, []);
+                }
+                flaps.set(k, flaps.get(k).concat(v));
+            }
+            readyForProcessing = readyForProcessing.concat(addToReady);
+            finalizedTriangles.push([
+                new CSG.Vector3D(transformed[0]),
+                new CSG.Vector3D(transformed[1]),
+                new CSG.Vector3D(transformed[2]), current[0]]);
+
+            processedTriangles.add(current[0]);
+
+        }
+        if (finalizedTriangles.length == 0) {
+            die('No more work?');
+        }
+        let ob = []
+        for (let i = 0; i < finalizedTriangles.length; ++i) {
+            const elt = finalizedTriangles[i];
+            checkWithinEpsilon(elt[0].z);
+            checkWithinEpsilon(elt[1].z);
+            checkWithinEpsilon(elt[2].z);
+            label = globalParams.includeLabels ? elt[3] : -1;
+            ob.push(makeTriangleFrom(label, [elt[0], elt[1], elt[2]]));
+        }
+        ob = addToArray(ob, flapsToCAGs(flaps));
+        ret.push(ob);
+    }
+
+    // Each element of |ret| corresponds to a connected component in the input.
+    // Shift each one by enough to clear the previous components' bounds.
+    let previousShift = new CSG.Vector2D(0, 0);
+    let ob = [];
+    for (var i = 0; i < ret.length; ++i) {
+        const thisBounds = getBoundsFor(ret[i]);
+        const thisShift = previousShift.minus(thisBounds[0]);
+        previousShift = previousShift.minus(thisBounds[0]).plus(thisBounds[1]);
+        for (var j = 0; j < ret[i].length; ++j) {
+            ob = addToArray(ob, translate(ret[i][j], thisShift));
+        }
+    }
+    
+    // Now recenter the whole pile to make a more sensible default-camera view.
+    const recenterShift = previousShift.times(-1/2);
+    return translate(ob, recenterShift);
+}
+
+function addToArray(array, thing) {
+    if (Array.isArray(thing)) {
+        array = array.concat(thing);
+        return array;
+    }
+    if (typeof thing[Symbol.iterator] === 'function') {
+        for (var elt of thing) {
+            array = addToArray(array, elt);
+        }
+        return array;
+    }
+    array.push(thing);
+    return array;
+}
+
+function translate(thing, translation) {
+    if (Array.isArray(thing)) {
+        return thing.map((elt) => translate(elt, translation));
+    }
+    if (thing instanceof Map) {
+        return new Map(Array.from(thing.entries()).map((e) => [e[0], translate(e[1], translation)]));
+    }
+    return thing.translate(translation);
+}
+
+function getBoundsFor(arr) {
+    let min = new CSG.Vector2D(0, 0);
+    let max = new CSG.Vector2D(0, 0);
+    arr.forEach((obj) => {
+        if (Array.isArray(obj) || obj instanceof Map) {
+            const b = getBoundsFor(obj);
+            min = min.min(b[0]);
+            max = max.max(b[1]);
+            return;
+        }
+        const bounds = obj.getBounds();
+        min = min.min(bounds[0]);
+        max = max.max(bounds[1]);
+    });
+    return [min, max];
+}
+
+// Accepts params to polyhedron() (points & polygons/triangles) and
+// simplifies by splitting polygons into triangles, deduping vertices,
+// splitting triangles to enforce the constraint that triangle edges
+// are always identical or distinct never partially overlapping, and
+// sorting triangles by area.
+function simplifyGeometry(params) {
+    if (params.polygons) {
+        if (params.triangles) die('Must not specify both polygons and triangles!');
+        params.triangles = []
+        const createTrianglesFromPolygon = (poly) => {
+            if (poly.length < 3) die('Polygon must have at least 3 sides', poly);
+            const ret = [];
+            for (let i = 2; i < poly.length; ++i) {
+                ret.push([poly[i-2], poly[i-1], poly[i]]);
+            }
+            return ret;
+        };
+        for (let i = 0; i < params.polygons.length; ++i) {
+            params.triangles = params.triangles.concat(createTrianglesFromPolygon(params.polygons[i]));
+        }
+        delete params.polygons;
+    }
+
+    let seenPoints = {};  // Key: stringified point, value: first index where the point was seen.
+    let pointToFirst = {};  // Key: index of a duplicated point, value: index of first identical point.
+    let uniquePoints = [];
+    for (var i = 0; i < params.points.length; ++i) {
+        const point = params.points[i];
+        const key = JSON.stringify(point);
+        const first = seenPoints[key];
+        if (first !== undefined) {
+            pointToFirst[i] = first;
+        } else {
+            seenPoints[key] = uniquePoints.length;
+            pointToFirst[i] = uniquePoints.length;
+            uniquePoints.push(point);
+        }
+    }
+
+    // Ensure there isn't degeneracy in the input; in particular
+    // overly-close-but-not-identical points are likely to confuse our
+    // epsilon-based testing elsewhere, so make sure we don't have any
+    // of that.
+    for (var i = 0; i < uniquePoints.length; ++i) {
+        const vi = vec3(uniquePoints[i]);
+        for (var j = i + 1; j < uniquePoints.length; ++j) {
+            const vj = vec3(uniquePoints[j]);
+            if (withinEpsilon(vi.minus(vj).length())) {
+                die('Vertices too close to each other! ' + vi + ', ' + vj);
+            }
+        }
+    }
+
+    // Mirror points above.
+    let newTriangles = [];
+    let seenTriangles = {};
+    const startTriangle = 0;
+    const endTriangle = params.triangles.length;
+    for (var i = startTriangle; i < endTriangle; ++i) {
+        const triangle = params.triangles[i];
+        const newTriangle = [pointToFirst[triangle[0]], pointToFirst[triangle[1]], pointToFirst[triangle[2]]];
+        const key = JSON.stringify(newTriangle);
+        if (seenTriangles[key] !== undefined) {
+            die('Duplicate triangle: ' + key);
+        }
+        seenTriangles[key] = 1;
+        newTriangles.push(newTriangle);
+    }
+
+    // Now make sure that no vertex lies on a triangle's edge.
+    for (let fixThenCheck = 0; fixThenCheck < 2; ++fixThenCheck) {
+        for (var i = 0; i < uniquePoints.length; ++i) {
+            const point = vec3(uniquePoints[i]);
+            for (var j = 0; j < newTriangles.length; ++j) {
+                const triangle = newTriangles[j];
+                if (triangle[0] == i || triangle[1] == i || triangle[2] == i) {
+                    continue;
+                }
+                v0 = vec3(uniquePoints[triangle[0]]);
+                v1 = vec3(uniquePoints[triangle[1]]);
+                v2 = vec3(uniquePoints[triangle[2]]);
+                const on01 = pointOnLine(point, v0, v1);
+                const on12 = pointOnLine(point, v1, v2);
+                const on20 = pointOnLine(point, v2, v0);
+                let added = false;
+                if (on01) {
+                    newTriangles.push([triangle[0], i, triangle[2]]);
+                    newTriangles.push([i, triangle[2], triangle[1]]);
+                    added = true;
+                } else if (on12) {
+                    newTriangles.push([triangle[1], i, triangle[0]]);
+                    newTriangles.push([i, triangle[0], triangle[2]]);
+                    added = true;
+                } else if (on20) {
+                    newTriangles.push([triangle[2], i, triangle[1]]);
+                    newTriangles.push([i, triangle[1], triangle[0]]);
+                    added = true;
+                }
+                if (added) {
+                    if (fixThenCheck) {
+                        die('Still needed to fix after a full pass!');
+                    }
+                    newTriangles.splice(j, 1);
+                    i = -1;
+                    break;
+                }
+            }
+        }
+    }
+
+    
+    let triangleArea = (t) => {
+        const v0 = vec3(uniquePoints[t[0]]);
+        const v1 = vec3(uniquePoints[t[1]]);
+        const v2 = vec3(uniquePoints[t[2]]);
+        const line01 = CSG.Line3D.fromPoints(v0, v1);
+        const h = line01.distanceToPoint(v2);
+        return 0.5 * h * v1.minus(v2).length();
+    };
+    newTriangles.sort((a, b) => triangleArea(b) - triangleArea(a));
+    return { points: uniquePoints, triangles: newTriangles };
+}
+
+// Returns true iff point is on the line between v1 and v2.
+function pointOnLine(point, v1, v2) {
+    const line = CSG.Line3D.fromPoints(v1, v2);
+    if (!withinEpsilon(line.distanceToPoint(point))) {
+        return false;
+    }
+    const v1v2LengthSquared = v1.minus(v2).lengthSquared();
+    return v1.minus(point).lengthSquared() < v1v2LengthSquared &&
+        v2.minus(point).lengthSquared() < v1v2LengthSquared;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+function pyramid() {
+    return {
+        // OpenJSCAD's documentation polyhedron() example.
+        points: [ [10,10,0],[10,-10,0],[-10,-10,0],[-10,10,0], [0,0,10] ],
+        triangles: [ [0,1,4],[1,2,4],[2,3,4],[3,0,4], [1,0,3],[2,1,3] ],
+    };
+}
+</textarea>
+<script type="text/javascript">
+var gProcessor = null;        // required by OpenJScad.org
+var edit_code = document.getElementById("zone_code").value;
+
+function loadProcessor() {
+	var vc = document.getElementById('viewerContext');
+	gProcessor = new OpenJsCad.Processor(vc);
+}
+
+function LoadSTL(evt){	
+	var f = FSTL.files[0];
+	var reader = new FileReader();
+	reader.onload = function(e) {
+		var stl = reader.result;
+		var ch = parseSTL(stl, f.name, "volume");
+		// suppression de polyhedron( et )
+		ch = ch.replace("main", "volume");
+		ch = ch.replace("polyhedron(", "");
+		ch = ch.replace("})", "}");
+		//console.log(ch);
+		var code = edit_code +"\n"+ ch;
+		gProcessor.setJsCad(code,f.name);
+	}
+	reader.readAsBinaryString(f,"UTF-8");
+}
+
+function recup_tab(nom, chaine){
+	var z = document.getElementsByName(nom)[0];
+	z.value = chaine;
+}
+
+// actions de fin d'initialisation
+document.getElementById('FSTL').addEventListener('change', LoadSTL, false);
+</script>
+</body>
+
+</html>
